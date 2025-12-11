@@ -1053,9 +1053,9 @@ async function handlePaymentFailed(invoice: any) {
 }
 
 // Start server
-app.listen(PORT, () => {
+app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 Debt Eraser Pro Server running on port ${PORT}`);
-  console.log(`📝 API endpoints available at http://localhost:${PORT}/api`);
+  console.log(`📝 API endpoints available at http://0.0.0.0:${PORT}/api`);
   console.log(`💳 Stripe integration: ${process.env.STRIPE_SECRET_KEY ? 'ENABLED' : 'DISABLED'}`);
   console.log(`🔔 Stripe webhooks: ${process.env.STRIPE_WEBHOOK_SECRET ? 'ENABLED' : 'DISABLED'}`);
   console.log(`🤖 Gemini AI: ${process.env.GEMINI_API_KEY ? 'ENABLED' : 'DISABLED'}`);
