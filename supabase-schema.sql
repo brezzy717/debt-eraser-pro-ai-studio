@@ -18,6 +18,9 @@ CREATE TABLE IF NOT EXISTS users (
   membership_type TEXT DEFAULT 'free',
   has_community_access BOOLEAN DEFAULT FALSE,
   has_consult_access BOOLEAN DEFAULT FALSE,
+  stripe_customer_id TEXT,
+  stripe_subscription_id TEXT,
+  subscription_status TEXT,
   created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 

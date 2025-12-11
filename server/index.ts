@@ -26,6 +26,68 @@ app.use(cors({
   origin: process.env.CLIENT_URL || 'http://localhost:3000',
   credentials: true
 }));
+
+// Stripe webhook needs raw body, so we add it BEFORE express.json()
+app.post('/api/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  const sig = req.headers['stripe-signature'];
+  const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+
+  if (!webhookSecret) {
+    console.error('⚠️ Stripe webhook secret not configured');
+    return res.status(500).send('Webhook secret not configured');
+  }
+
+  let event;
+
+  try {
+    event = stripe.webhooks.constructEvent(req.body, sig!, webhookSecret);
+  } catch (err: any) {
+    console.error('⚠️ Webhook signature verification failed:', err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  // Handle the event
+  try {
+    switch (event.type) {
+      case 'customer.subscription.created':
+        console.log('✅ Subscription created:', event.data.object.id);
+        // Grant access to community
+        await handleSubscriptionCreated(event.data.object);
+        break;
+
+      case 'customer.subscription.updated':
+        console.log('✅ Subscription updated:', event.data.object.id);
+        await handleSubscriptionUpdated(event.data.object);
+        break;
+
+      case 'customer.subscription.deleted':
+        console.log('❌ Subscription cancelled:', event.data.object.id);
+        // Revoke access
+        await handleSubscriptionDeleted(event.data.object);
+        break;
+
+      case 'invoice.payment_succeeded':
+        console.log('💰 Payment succeeded:', event.data.object.id);
+        await handlePaymentSucceeded(event.data.object);
+        break;
+
+      case 'invoice.payment_failed':
+        console.log('⚠️ Payment failed:', event.data.object.id);
+        await handlePaymentFailed(event.data.object);
+        break;
+
+      default:
+        console.log(`Unhandled event type: ${event.type}`);
+    }
+
+    res.json({ received: true });
+  } catch (error) {
+    console.error('Error handling webhook:', error);
+    res.status(500).send('Webhook handler failed');
+  }
+});
+
+// Now apply express.json() for all other routes
 app.use(express.json());
 
 // Set up file storage
@@ -178,47 +240,93 @@ app.post('/api/chat', async (req, res) => {
 // STRIPE PAYMENT ENDPOINTS
 // ============================================
 
-// Create payment intent
+// Create payment (subscription for community, one-time for consultation)
 app.post('/api/create-payment-intent', async (req, res) => {
   try {
-    const { plan, email } = req.body;
+    const { plan, email, name } = req.body;
 
-    const amounts = {
-      community: 9700, // $97.00
-      consult: 29700   // $297.00
-    };
-
-    const amount = amounts[plan as keyof typeof amounts];
-    if (!amount) {
-      return res.status(400).json({ error: 'Invalid plan' });
+    if (!plan || !email) {
+      return res.status(400).json({ error: 'Missing required fields' });
     }
 
-    const paymentIntent = await stripe.paymentIntents.create({
-      amount,
-      currency: 'usd',
-      metadata: { plan, email },
-      receipt_email: email
-    });
+    // Community = Subscription, Consultation = One-time payment
+    if (plan === 'community') {
+      // Create or retrieve customer
+      let customer;
+      const existingCustomers = await stripe.customers.list({
+        email: email,
+        limit: 1
+      });
 
-    res.json({ clientSecret: paymentIntent.client_secret });
+      if (existingCustomers.data.length > 0) {
+        customer = existingCustomers.data[0];
+      } else {
+        customer = await stripe.customers.create({
+          email: email,
+          name: name || email,
+          metadata: { plan }
+        });
+      }
+
+      // Create subscription
+      const subscription = await stripe.subscriptions.create({
+        customer: customer.id,
+        items: [{ price: process.env.STRIPE_SUBSCRIPTION_PRICE_ID }],
+        payment_behavior: 'default_incomplete',
+        payment_settings: { save_default_payment_method: 'on_subscription' },
+        expand: ['latest_invoice.payment_intent'],
+        metadata: { plan, email }
+      });
+
+      const invoice = subscription.latest_invoice as any;
+      const paymentIntent = invoice.payment_intent;
+
+      res.json({
+        clientSecret: paymentIntent.client_secret,
+        subscriptionId: subscription.id
+      });
+    } else if (plan === 'consult') {
+      // One-time payment for consultation
+      const paymentIntent = await stripe.paymentIntents.create({
+        amount: 29700, // $297.00
+        currency: 'usd',
+        metadata: { plan, email },
+        receipt_email: email
+      });
+
+      res.json({ clientSecret: paymentIntent.client_secret });
+    } else {
+      return res.status(400).json({ error: 'Invalid plan' });
+    }
   } catch (error) {
-    console.error('Payment intent error:', error);
-    res.status(500).json({ error: 'Failed to create payment intent' });
+    console.error('Payment creation error:', error);
+    res.status(500).json({ error: 'Failed to create payment' });
   }
 });
 
 // Verify payment
 app.post('/api/verify-payment', async (req, res) => {
   try {
-    const { paymentIntentId } = req.body;
+    const { paymentIntentId, subscriptionId } = req.body;
 
-    const paymentIntent = await stripe.paymentIntents.retrieve(paymentIntentId);
-
-    res.json({
-      status: paymentIntent.status,
-      amount: paymentIntent.amount,
-      metadata: paymentIntent.metadata
-    });
+    if (subscriptionId) {
+      // Verify subscription payment
+      const subscription = await stripe.subscriptions.retrieve(subscriptionId);
+      res.json({
+        status: subscription.status,
+        metadata: subscription.metadata
+      });
+    } else if (paymentIntentId) {
+      // Verify one-time payment
+      const paymentIntent = await stripe.paymentIntents.retrieve(paymentIntentId);
+      res.json({
+        status: paymentIntent.status,
+        amount: paymentIntent.amount,
+        metadata: paymentIntent.metadata
+      });
+    } else {
+      return res.status(400).json({ error: 'Missing payment ID' });
+    }
   } catch (error) {
     console.error('Payment verification error:', error);
     res.status(500).json({ error: 'Failed to verify payment' });
@@ -863,11 +971,93 @@ app.post('/api/email/send-consult-confirmation', async (req, res) => {
   }
 });
 
+// ============================================
+// STRIPE WEBHOOK HANDLERS
+// ============================================
+
+async function handleSubscriptionCreated(subscription: any) {
+  const customerEmail = subscription.metadata?.email;
+  const plan = subscription.metadata?.plan;
+
+  if (!customerEmail) {
+    console.error('No email in subscription metadata');
+    return;
+  }
+
+  try {
+    // Update user access in database
+    const { error } = await supabase
+      .from('users')
+      .update({
+        membership_type: plan === 'community' ? 'paid' : 'free',
+        has_community_access: plan === 'community',
+        stripe_customer_id: subscription.customer,
+        stripe_subscription_id: subscription.id,
+        subscription_status: subscription.status
+      })
+      .eq('email', customerEmail);
+
+    if (error) throw error;
+
+    console.log(`✅ Access granted for ${customerEmail}`);
+
+    // Send welcome email
+    await sendWelcomeEmail(customerEmail, customerEmail.split('@')[0]);
+  } catch (error) {
+    console.error('Error handling subscription created:', error);
+  }
+}
+
+async function handleSubscriptionUpdated(subscription: any) {
+  try {
+    const { error } = await supabase
+      .from('users')
+      .update({
+        subscription_status: subscription.status
+      })
+      .eq('stripe_subscription_id', subscription.id);
+
+    if (error) throw error;
+    console.log(`✅ Subscription updated: ${subscription.id}`);
+  } catch (error) {
+    console.error('Error handling subscription updated:', error);
+  }
+}
+
+async function handleSubscriptionDeleted(subscription: any) {
+  try {
+    // Revoke access
+    const { error } = await supabase
+      .from('users')
+      .update({
+        has_community_access: false,
+        subscription_status: 'cancelled'
+      })
+      .eq('stripe_subscription_id', subscription.id);
+
+    if (error) throw error;
+    console.log(`❌ Access revoked for subscription: ${subscription.id}`);
+  } catch (error) {
+    console.error('Error handling subscription deleted:', error);
+  }
+}
+
+async function handlePaymentSucceeded(invoice: any) {
+  console.log(`💰 Payment succeeded for customer: ${invoice.customer}`);
+  // Could send receipt email here if needed
+}
+
+async function handlePaymentFailed(invoice: any) {
+  console.log(`⚠️ Payment failed for customer: ${invoice.customer}`);
+  // Could send payment failure notification here
+}
+
 // Start server
 app.listen(PORT, () => {
   console.log(`🚀 Debt Eraser Pro Server running on port ${PORT}`);
   console.log(`📝 API endpoints available at http://localhost:${PORT}/api`);
   console.log(`💳 Stripe integration: ${process.env.STRIPE_SECRET_KEY ? 'ENABLED' : 'DISABLED'}`);
+  console.log(`🔔 Stripe webhooks: ${process.env.STRIPE_WEBHOOK_SECRET ? 'ENABLED' : 'DISABLED'}`);
   console.log(`🤖 Gemini AI: ${process.env.GEMINI_API_KEY ? 'ENABLED' : 'DISABLED'}`);
   console.log(`📊 HubSpot CRM: ${process.env.HUBSPOT_API_KEY ? 'ENABLED' : 'DISABLED'}`);
   console.log(`📧 Mailjet Email: ${process.env.MAILJET_API_KEY && process.env.MAILJET_SECRET_KEY ? 'ENABLED' : 'DISABLED'}`);
